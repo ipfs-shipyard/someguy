@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 
 	"github.com/CAFxX/httpcompression"
 	"github.com/felixge/httpsnoop"
@@ -33,60 +38,35 @@ func withRequestLogger(next http.Handler) http.Handler {
 	})
 }
 
-func start(ctx context.Context, listenAddress string, runAcceleratedDHTClient bool, contentEndpoints, peerEndpoints, ipnsEndpoints []string) error {
-	h, err := newHost(runAcceleratedDHTClient)
+type serverOptions struct {
+	listenAddress    string
+	acceleratedDHT   bool
+	putEnabled       bool
+	contentEndpoints []string
+	peerEndpoints    []string
+	ipnsEndpoints    []string
+	dataDirectory    string
+}
+
+func startServer(ctx context.Context, options *serverOptions) error {
+	router, err := newRouter(ctx, options)
 	if err != nil {
 		return err
 	}
 
-	var dhtRouting routing.Routing
-	if runAcceleratedDHTClient {
-		wrappedDHT, err := newBundledDHT(ctx, h)
-		if err != nil {
-			return err
-		}
-		dhtRouting = wrappedDHT
-	} else {
-		standardDHT, err := dht.New(ctx, h, dht.Mode(dht.ModeClient), dht.BootstrapPeers(dht.GetDefaultBootstrapPeerAddrInfos()...))
-		if err != nil {
-			return err
-		}
-		dhtRouting = standardDHT
-	}
-
-	crRouters, err := getCombinedRouting(contentEndpoints, dhtRouting)
+	_, port, err := net.SplitHostPort(options.listenAddress)
 	if err != nil {
 		return err
 	}
 
-	prRouters, err := getCombinedRouting(peerEndpoints, dhtRouting)
-	if err != nil {
-		return err
-	}
-
-	ipnsRouters, err := getCombinedRouting(ipnsEndpoints, dhtRouting)
-	if err != nil {
-		return err
-	}
-
-	_, port, err := net.SplitHostPort(listenAddress)
-	if err != nil {
-		return err
-	}
-
-	log.Printf("Starting %s %s\n", name, version)
-	log.Printf("Listening on %s", listenAddress)
+	log.Printf("Listening on %s", options.listenAddress)
 	log.Printf("Delegated Routing API on http://127.0.0.1:%s/routing/v1", port)
 
 	mdlw := middleware.New(middleware.Config{
 		Recorder: metrics.NewRecorder(metrics.Config{Prefix: "someguy"}),
 	})
 
-	handler := server.Handler(&composableRouter{
-		providers: crRouters,
-		peers:     prRouters,
-		ipns:      ipnsRouters,
-	})
+	handler := server.Handler(router)
 
 	// Add CORS.
 	handler = cors.New(cors.Options{
@@ -115,8 +95,91 @@ func start(ctx context.Context, listenAddress string, runAcceleratedDHTClient bo
 	})
 	http.Handle("/", handler)
 
-	server := &http.Server{Addr: listenAddress, Handler: nil}
-	return server.ListenAndServe()
+	server := &http.Server{Addr: options.listenAddress, Handler: nil}
+
+	quit := make(chan os.Signal, 2)
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		err := server.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintf(os.Stderr, "Failed to start gateway: %s\n", err)
+			quit <- os.Interrupt
+		}
+	}()
+
+	signal.Notify(
+		quit,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGHUP,
+	)
+	<-quit
+	go server.Close()
+	go router.Close()
+
+	wg.Wait()
+
+	return nil
+}
+
+func newRouter(ctx context.Context, options *serverOptions) (router, error) {
+	h, err := newHost(options.acceleratedDHT)
+	if err != nil {
+		return nil, err
+	}
+
+	var dhtRouting routing.Routing
+	if options.acceleratedDHT {
+		wrappedDHT, err := newBundledDHT(ctx, h)
+		if err != nil {
+			return nil, err
+		}
+		dhtRouting = wrappedDHT
+	} else {
+		standardDHT, err := dht.New(ctx, h, dht.Mode(dht.ModeClient), dht.BootstrapPeers(dht.GetDefaultBootstrapPeerAddrInfos()...))
+		if err != nil {
+			return nil, err
+		}
+		dhtRouting = standardDHT
+	}
+
+	crRouters, err := getCombinedRouting(options.contentEndpoints, dhtRouting, options.putEnabled)
+	if err != nil {
+		return nil, err
+	}
+
+	prRouters, err := getCombinedRouting(options.peerEndpoints, dhtRouting, options.putEnabled)
+	if err != nil {
+		return nil, err
+	}
+
+	ipnsRouters, err := getCombinedRouting(options.ipnsEndpoints, dhtRouting, options.putEnabled)
+	if err != nil {
+		return nil, err
+	}
+
+	remoteRouter := &composableRouter{
+		providers: crRouters,
+		peers:     prRouters,
+		ipns:      ipnsRouters,
+	}
+
+	if options.dataDirectory == "" {
+		return remoteRouter, nil
+	}
+
+	localRouter, err := newLocalRouter(options.dataDirectory)
+	if err != nil {
+		return nil, err
+	}
+
+	return &parallelRouter{
+		routers: []router{localRouter, remoteRouter},
+	}, nil
 }
 
 func newHost(highOutboundLimits bool) (host.Host, error) {
@@ -153,9 +216,9 @@ func newHost(highOutboundLimits bool) (host.Host, error) {
 	return h, nil
 }
 
-func getCombinedRouting(endpoints []string, dht routing.Routing) (router, error) {
+func getCombinedRouting(endpoints []string, dht routing.Routing, putEnabled bool) (router, error) {
 	if len(endpoints) == 0 {
-		return libp2pRouter{routing: dht}, nil
+		return libp2pRouter{routing: dht, putEnabled: putEnabled}, nil
 	}
 
 	var routers []router
@@ -165,10 +228,10 @@ func getCombinedRouting(endpoints []string, dht routing.Routing) (router, error)
 		if err != nil {
 			return nil, err
 		}
-		routers = append(routers, clientRouter{Client: drclient})
+		routers = append(routers, clientRouter{client: drclient, putEnabled: putEnabled})
 	}
 
 	return sanitizeRouter{parallelRouter{
-		routers: append(routers, libp2pRouter{routing: dht}),
+		routers: append(routers, libp2pRouter{routing: dht, putEnabled: putEnabled}),
 	}}, nil
 }

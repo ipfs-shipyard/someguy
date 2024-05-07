@@ -5,6 +5,8 @@
 - [Configuration](#configuration)
   - [`SOMEGUY_LISTEN_ADDRESS`](#someguy_listen_address)
   - [`SOMEGUY_ACCELERATED_DHT`](#someguy_accelerated_dht)
+  - [`SOMEGUY_PUT_ENABLED`](#someguy_put_enabled)
+  - [`SOMEGUY_DATADIR`](#someguy_datadir)
   - [`SOMEGUY_PROVIDER_ENDPOINTS`](#someguy_provider_endpoints)
   - [`SOMEGUY_PEER_ENDPOINTS`](#someguy_peer_endpoints)
   - [`SOMEGUY_IPNS_ENDPOINTS`](#someguy_ipns_endpoints)
@@ -27,6 +29,26 @@ Default: `127.0.0.1:8190`
 Whether or not the Accelerated DHT is enabled or not.
 
 Default: `true`
+
+### `SOMEGUY_PUT_ENABLED`
+
+Whether or not to accept Delegated Routing V1 PUT requests. Affects all PUT requests:
+provider records, peer records and IPNS records.
+
+By default, PUT requests are ignored. Therefore, they will neither be stored locally,
+nor sent to other remote endpoints.
+
+Default: `false`
+
+### `SOMEGUY_DATADIR`
+
+Used in conjunction with [`SOMEGUY_PUT_ENABLED`](#someguy_put_enabled).
+
+The LevelDB data directory to persist PUT records. When receiving PUT requests,
+the records will be stored in this database. The database is queried for GET
+requests.
+
+Default: none
 
 ### `SOMEGUY_PROVIDER_ENDPOINTS`
 
